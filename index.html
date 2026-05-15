@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="NDX 定投" />
+  <meta name="theme-color" content="#0a84ff" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="icons/icon-180.png" />
+  <link rel="icon" href="icons/icon-180.png" />
+  <link rel="stylesheet" href="styles.css" />
+  <title>NDX 五因子定投助手</title>
+</head>
+<body>
+  <div class="app">
+    <header class="hero">
+      <div class="hero-top">
+        <div>
+          <div class="hero-title">纳斯达克 100 · 五因子定投</div>
+          <div class="hero-sub" id="updated">加载中…</div>
+        </div>
+        <button id="refreshBtn" class="icon-btn" aria-label="刷新">↻</button>
+      </div>
+      <div class="price-row">
+        <div class="price" id="price">—</div>
+        <div class="change" id="change">—</div>
+      </div>
+    </header>
+
+    <section class="card score-card">
+      <div class="gauge-wrap">
+        <svg viewBox="0 0 200 120" class="gauge">
+          <path d="M 20 110 A 80 80 0 0 1 180 110" fill="none" stroke="#2c2c2e" stroke-width="14" stroke-linecap="round" />
+          <path id="gaugeArc" d="M 20 110 A 80 80 0 0 1 180 110" fill="none" stroke="url(#gradient)" stroke-width="14" stroke-linecap="round" stroke-dasharray="0 251" />
+          <defs>
+            <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stop-color="#ff453a" />
+              <stop offset="50%" stop-color="#ffd60a" />
+              <stop offset="100%" stop-color="#30d158" />
+            </linearGradient>
+          </defs>
+        </svg>
+        <div class="gauge-text">
+          <div class="score-num" id="scoreNum">—</div>
+          <div class="score-label">综合定投分</div>
+        </div>
+      </div>
+      <div class="advice" id="advice">—</div>
+      <div class="amount-row">
+        <div class="amount-block">
+          <div class="amount-label">建议倍数</div>
+          <div class="amount-val" id="multiplier">—</div>
+        </div>
+        <div class="amount-block">
+          <div class="amount-label">今日建议</div>
+          <div class="amount-val" id="todayAmount">—</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card pe-card">
+      <div class="card-title">PE 估值对比</div>
+      <div class="pe-grid">
+        <div class="pe-item">
+          <div class="pe-label">当前 PE (TTM)</div>
+          <div class="pe-val" id="peCurrent">—</div>
+          <div class="pe-sub" id="peCurrentSrc">—</div>
+        </div>
+        <div class="pe-item">
+          <div class="pe-label">历史平均 PE</div>
+          <div class="pe-val" id="peAvg">—</div>
+          <div class="pe-sub">长期均值参考</div>
+        </div>
+      </div>
+      <div class="pe-bar-wrap">
+        <div class="pe-bar"><div class="pe-bar-fill" id="peBarFill"></div></div>
+        <div class="pe-bar-labels"><span>低估</span><span>合理</span><span>高估</span></div>
+      </div>
+      <div class="pe-advice" id="peAdvice">—</div>
+    </section>
+
+    <section class="card">
+      <div class="card-title">5 因子打分</div>
+      <div id="factors" class="factors"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-title">设置</div>
+      <div class="settings">
+        <label class="setting-row">
+          <span>基准定投金额</span>
+          <div class="input-wrap">
+            <span>$</span>
+            <input id="baseAmount" type="number" min="1" step="1" />
+          </div>
+        </label>
+        <label class="setting-row">
+          <span>定投币种显示</span>
+          <select id="currency">
+            <option value="USD">USD ($)</option>
+            <option value="CNY">CNY (¥, 1 USD ≈ 7.2)</option>
+          </select>
+        </label>
+        <label class="setting-row">
+          <span>当前 PE 手动覆盖</span>
+          <div class="input-wrap">
+            <input id="manualPE" type="number" min="0" step="0.1" placeholder="自动" />
+          </div>
+        </label>
+        <label class="setting-row">
+          <span>历史平均 PE</span>
+          <div class="input-wrap">
+            <input id="avgPE" type="number" min="0" step="0.1" />
+          </div>
+        </label>
+      </div>
+    </section>
+
+    <section class="card faq">
+      <div class="card-title">使用说明</div>
+      <ol>
+        <li>每个交易日打开查看综合分与今日建议金额。</li>
+        <li>分数越高 = 市场越值得加大投入；越低 = 减少或暂停。</li>
+        <li>分数到投入金额的映射：<br/>
+          <span class="mono">0–20: 0.5×</span> · <span class="mono">20–40: 0.75×</span> · <span class="mono">40–60: 1.0×</span> · <span class="mono">60–80: 1.5×</span> · <span class="mono">80–100: 2.0×</span>
+        </li>
+        <li>本工具仅做策略参考，非投资建议。</li>
+      </ol>
+    </section>
+
+    <footer class="footer">
+      <div>数据来源: Yahoo Finance · ^NDX</div>
+      <div>添加到主屏幕即可像 App 一样使用</div>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('sw.js').catch(() => {});
+      });
+    }
+  </script>
+</body>
+</html>

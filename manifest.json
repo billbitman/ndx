@@ -1,0 +1,14 @@
+{
+  "name": "NDX 五因子定投助手",
+  "short_name": "NDX 定投",
+  "description": "纳斯达克 100 指数五因子量化定投每日建议",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#0a84ff",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "icons/icon-180.png", "sizes": "180x180", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
