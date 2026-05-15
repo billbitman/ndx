@@ -20,7 +20,8 @@ const STORE_KEY = 'ndx_dca_settings_v2';
 const CACHE_KEY = 'ndx_dca_cache_v3';
 const PE_CACHE_KEY = 'ndx_pe_cache_v3';
 
-const defaults = { baseAmount: 100, currency: 'USD', manualPE: '', avgPE: 24 };
+// 历史平均 PE: 26 ≈ NDX 近 15 年中位 (剔除互联网泡沫). 用户可改
+const defaults = { baseAmount: 100, currency: 'USD', manualPE: '', avgPE: 26 };
 let settings = loadSettings();
 let lastFactors = null;
 let lastPE = null;
@@ -124,26 +125,89 @@ async function fetchChart() {
   }
 }
 
+// ---- PE 获取: 多源兜底 ----
+async function peFromYahooQuote() {
+  const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${PE_SYMBOL}`;
+  const data = await tryProxies(url, async r => r.json());
+  const item = data.quoteResponse && data.quoteResponse.result && data.quoteResponse.result[0];
+  const pe = item && item.trailingPE;
+  if (typeof pe !== 'number' || pe <= 0) throw new Error('No trailingPE field');
+  return { pe, source: 'Yahoo Quote API' };
+}
+
+async function peFromYahooHTML() {
+  const url = `https://finance.yahoo.com/quote/${PE_SYMBOL}/`;
+  return tryProxies(url, async res => {
+    const html = await res.text();
+    // 嵌入式 JSON: "trailingPE":{"raw":XX.XX,"fmt":"XX.XX"}
+    let m = html.match(/"trailingPE"\s*:\s*\{\s*"raw"\s*:\s*([0-9.]+)/);
+    if (!m) m = html.match(/trailingPE[^0-9]{1,40}([0-9]{1,3}\.[0-9]+)/);
+    if (!m) throw new Error('No PE in Yahoo HTML');
+    const pe = parseFloat(m[1]);
+    if (!pe || pe < 1 || pe > 200) throw new Error('PE 异常: ' + pe);
+    return { pe, source: 'Yahoo HTML' };
+  });
+}
+
+async function peFromStockAnalysis() {
+  const url = `https://stockanalysis.com/etf/${PE_SYMBOL.toLowerCase()}/`;
+  return tryProxies(url, async res => {
+    const html = await res.text();
+    // 表格: <td>PE Ratio</td><td>XX.XX</td>  或类似结构
+    let m = html.match(/PE Ratio[^<>]*<\/[a-z]+>\s*<[^>]+>\s*([0-9]+\.?[0-9]*)/i);
+    if (!m) m = html.match(/"peRatio"\s*:\s*"?([0-9.]+)"?/i);
+    if (!m) m = html.match(/P\/E\s*Ratio[\s\S]{0,80}?>\s*([0-9]+\.[0-9]+)/i);
+    if (!m) throw new Error('No PE in stockanalysis');
+    const pe = parseFloat(m[1]);
+    if (!pe || pe < 1 || pe > 200) throw new Error('PE 异常: ' + pe);
+    return { pe, source: 'StockAnalysis.com' };
+  });
+}
+
+async function peFromWSJ() {
+  const url = `https://www.wsj.com/market-data/quotes/etf/${PE_SYMBOL}`;
+  return tryProxies(url, async res => {
+    const html = await res.text();
+    let m = html.match(/P\/E\s*Ratio[\s\S]{0,200}?<span[^>]*>\s*([0-9]+\.[0-9]+)/i);
+    if (!m) m = html.match(/peRatio["':\s]*([0-9]+\.[0-9]+)/i);
+    if (!m) throw new Error('No PE in WSJ');
+    const pe = parseFloat(m[1]);
+    if (!pe || pe < 1 || pe > 200) throw new Error('PE 异常: ' + pe);
+    return { pe, source: 'WSJ' };
+  });
+}
+
 async function fetchPE() {
   if (settings.manualPE && parseFloat(settings.manualPE) > 0) {
-    return { pe: parseFloat(settings.manualPE), source: '手动输入' };
+    return { pe: parseFloat(settings.manualPE), source: '手动覆盖' };
   }
-  // Yahoo v7 quote
-  const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${PE_SYMBOL}`;
-  try {
-    const data = await tryProxies(url, async r => r.json());
-    const item = data.quoteResponse && data.quoteResponse.result && data.quoteResponse.result[0];
-    const pe = item && item.trailingPE;
-    if (typeof pe !== 'number' || pe <= 0) throw new Error('No PE');
-    const cached = { pe, source: 'Yahoo · QQQ TTM', fetchedAt: Date.now() };
-    try { localStorage.setItem(PE_CACHE_KEY, JSON.stringify(cached)); } catch {}
-    return cached;
-  } catch (e) {
-    log('PE fail:', e.message);
-    const raw = localStorage.getItem(PE_CACHE_KEY);
-    if (raw) return { ...JSON.parse(raw), source: '离线缓存' };
-    return { pe: null, source: '获取失败 · 设置里手动输入' };
+  const sources = [
+    ['Yahoo Quote', peFromYahooQuote],
+    ['Yahoo HTML',  peFromYahooHTML],
+    ['StockAnaly',  peFromStockAnalysis],
+    ['WSJ',         peFromWSJ],
+  ];
+  const errs = [];
+  for (const [name, fn] of sources) {
+    try {
+      const r = await fn();
+      log('PE 成功 via', name, '=', r.pe);
+      const cached = { ...r, fetchedAt: Date.now() };
+      try { localStorage.setItem(PE_CACHE_KEY, JSON.stringify(cached)); } catch {}
+      return cached;
+    } catch (e) {
+      log('PE 失败', name, e.message);
+      errs.push(`${name}: ${e.message}`);
+    }
   }
+  // 全部失败 → 缓存
+  const raw = localStorage.getItem(PE_CACHE_KEY);
+  if (raw) {
+    const c = JSON.parse(raw);
+    return { ...c, source: c.source + ' · 离线缓存' };
+  }
+  log('PE 全部源失败:', errs.join(' | '));
+  return { pe: null, source: '获取失败' };
 }
 
 // ---- 指标计算 ----
@@ -399,8 +463,26 @@ function bindSettings() {
     if (!isNaN(v) && v > 0) {
       settings.avgPE = v;
       saveSettings();
+      markActivePreset();
       refresh();
     }
+  });
+  document.querySelectorAll('.preset').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const v = parseFloat(btn.dataset.pe);
+      settings.avgPE = v;
+      avgPEInput.value = v;
+      saveSettings();
+      markActivePreset();
+      refresh();
+    });
+  });
+  markActivePreset();
+}
+
+function markActivePreset() {
+  document.querySelectorAll('.preset').forEach(b => {
+    b.classList.toggle('active', parseFloat(b.dataset.pe) === parseFloat(settings.avgPE));
   });
 }
 
