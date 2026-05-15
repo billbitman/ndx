@@ -1,40 +1,31 @@
 // NDX 五因子量化定投助手
-// 数据源: Yahoo Finance (^NDX 行情, QQQ PE)
+// 数据源: Yahoo Finance + Stooq (CSV 备用)
 
-const SYMBOL = '%5ENDX';   // ^NDX URL-encoded
-const PE_SYMBOL = 'QQQ';   // QQQ ETF 跟踪 NDX, 用其 PE 代表 NDX 估值
+const SYMBOL_YAHOO = '%5ENDX'; // ^NDX URL-encoded
+const SYMBOL_STOOQ = '%5Endx'; // Stooq 也接受 ^ndx
+const PE_SYMBOL = 'QQQ';
 const RANGE = '2y';
 const INTERVAL = '1d';
 
-// 多通道获取数据，避免 CORS 阻塞
-function chartUrls(sym) {
-  const direct = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?range=${RANGE}&interval=${INTERVAL}`;
-  const direct2 = `https://query2.finance.yahoo.com/v8/finance/chart/${sym}?range=${RANGE}&interval=${INTERVAL}`;
-  return [
-    direct,
-    `https://corsproxy.io/?${encodeURIComponent(direct)}`,
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(direct2)}`,
-  ];
-}
-function quoteUrls(sym) {
-  // v7/finance/quote 包含 trailingPE
-  const direct = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${sym}`;
-  return [
-    direct,
-    `https://corsproxy.io/?${encodeURIComponent(direct)}`,
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(direct)}`,
-  ];
-}
+// ---- 多通道代理: 顺序尝试 ----
+const PROXIES = [
+  raw => raw, // 直连
+  raw => `https://corsproxy.io/?${encodeURIComponent(raw)}`,
+  raw => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(raw)}`,
+  raw => `https://api.allorigins.win/raw?url=${encodeURIComponent(raw)}`,
+  raw => `https://cors.eu.org/${raw}`,
+];
 
 const STORE_KEY = 'ndx_dca_settings_v2';
-const CACHE_KEY = 'ndx_dca_cache_v2';
-const PE_CACHE_KEY = 'ndx_pe_cache_v2';
+const CACHE_KEY = 'ndx_dca_cache_v3';
+const PE_CACHE_KEY = 'ndx_pe_cache_v3';
 
-// 纳指 100 长期平均 PE 约 24（约 2000-2024 年中位数）
 const defaults = { baseAmount: 100, currency: 'USD', manualPE: '', avgPE: 24 };
 let settings = loadSettings();
 let lastFactors = null;
 let lastPE = null;
+
+const log = (...a) => console.log('[NDX]', ...a);
 
 function loadSettings() {
   try {
@@ -46,62 +37,112 @@ function saveSettings() {
   localStorage.setItem(STORE_KEY, JSON.stringify(settings));
 }
 
-async function tryFetch(urls) {
+async function tryProxies(rawUrl, parser) {
   let lastErr;
-  for (const u of urls) {
+  for (const wrap of PROXIES) {
+    const u = wrap(rawUrl);
     try {
-      const res = await fetch(u, { cache: 'no-store' });
+      log('fetch', u.substring(0, 80));
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 10000);
+      const res = await fetch(u, { cache: 'no-store', signal: ctrl.signal });
+      clearTimeout(timer);
       if (!res.ok) throw new Error('HTTP ' + res.status);
-      return await res.json();
-    } catch (e) { lastErr = e; }
+      const out = await parser(res);
+      log('ok via', wrap.toString().includes('raw') && !wrap.toString().includes('encodeURI') ? 'direct' : u.split('?')[0]);
+      return out;
+    } catch (e) {
+      lastErr = e;
+      log('fail:', e.message);
+    }
   }
-  throw lastErr || new Error('全部端点失败');
+  throw lastErr || new Error('全部代理失败');
+}
+
+// ---- 数据源 1: Yahoo Finance ----
+async function fetchYahooChart() {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${SYMBOL_YAHOO}?range=${RANGE}&interval=${INTERVAL}`;
+  return tryProxies(url, async res => {
+    const data = await res.json();
+    const result = data.chart && data.chart.result && data.chart.result[0];
+    if (!result) throw new Error('Yahoo empty');
+    const ts = result.timestamp;
+    const closes = result.indicators.quote[0].close;
+    const series = ts.map((t, i) => ({ t: t * 1000, c: closes[i] })).filter(d => d.c != null);
+    if (series.length < 220) throw new Error('Insufficient ' + series.length);
+    return series;
+  });
+}
+
+// ---- 数据源 2: Stooq CSV (CORS 友好备用) ----
+async function fetchStooqChart() {
+  // Stooq 要求小写 ndx 并带 ^
+  const url = `https://stooq.com/q/d/l/?s=^ndx&i=d`;
+  return tryProxies(url, async res => {
+    const text = await res.text();
+    if (!text || text.length < 200) throw new Error('Stooq empty');
+    const lines = text.trim().split('\n');
+    const header = lines[0].toLowerCase();
+    if (!header.includes('close')) throw new Error('Stooq header bad');
+    const cols = header.split(',');
+    const dateIdx = cols.indexOf('date');
+    const closeIdx = cols.indexOf('close');
+    const series = [];
+    for (let i = 1; i < lines.length; i++) {
+      const parts = lines[i].split(',');
+      const d = parts[dateIdx];
+      const c = parseFloat(parts[closeIdx]);
+      if (!d || isNaN(c)) continue;
+      series.push({ t: new Date(d).getTime(), c });
+    }
+    if (series.length < 220) throw new Error('Stooq short ' + series.length);
+    // 取最近 2 年
+    return series.slice(-520);
+  });
 }
 
 async function fetchChart() {
+  // Yahoo 优先 (有最新当日), Stooq 备份 (CORS 稳)
   try {
-    const data = await tryFetch(chartUrls(SYMBOL));
-    const result = data.chart && data.chart.result && data.chart.result[0];
-    if (!result) throw new Error('Empty response');
-    const ts = result.timestamp;
-    const closes = result.indicators.quote[0].close;
-    const highs = result.indicators.quote[0].high;
-    const lows = result.indicators.quote[0].low;
-    const series = ts.map((t, i) => ({
-      t: t * 1000,
-      c: closes[i],
-      h: highs[i],
-      l: lows[i],
-    })).filter(d => d.c != null);
-    if (series.length < 220) throw new Error('Insufficient data');
-    const cached = { series, fetchedAt: Date.now() };
+    const series = await fetchYahooChart();
+    const cached = { series, fetchedAt: Date.now(), source: 'Yahoo' };
     try { localStorage.setItem(CACHE_KEY, JSON.stringify(cached)); } catch {}
     return cached;
-  } catch (e) {
-    const raw = localStorage.getItem(CACHE_KEY);
-    if (raw) return { ...JSON.parse(raw), stale: true };
-    throw e;
+  } catch (e1) {
+    log('Yahoo failed, try Stooq:', e1.message);
+    try {
+      const series = await fetchStooqChart();
+      const cached = { series, fetchedAt: Date.now(), source: 'Stooq' };
+      try { localStorage.setItem(CACHE_KEY, JSON.stringify(cached)); } catch {}
+      return cached;
+    } catch (e2) {
+      log('Stooq failed:', e2.message);
+      const raw = localStorage.getItem(CACHE_KEY);
+      if (raw) return { ...JSON.parse(raw), stale: true };
+      throw new Error(`Yahoo: ${e1.message} / Stooq: ${e2.message}`);
+    }
   }
 }
 
 async function fetchPE() {
-  // 用户手动覆盖优先
-  if (settings.manualPE && settings.manualPE > 0) {
-    return { pe: parseFloat(settings.manualPE), source: '用户手动输入' };
+  if (settings.manualPE && parseFloat(settings.manualPE) > 0) {
+    return { pe: parseFloat(settings.manualPE), source: '手动输入' };
   }
+  // Yahoo v7 quote
+  const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${PE_SYMBOL}`;
   try {
-    const data = await tryFetch(quoteUrls(PE_SYMBOL));
+    const data = await tryProxies(url, async r => r.json());
     const item = data.quoteResponse && data.quoteResponse.result && data.quoteResponse.result[0];
-    if (!item) throw new Error('No quote');
-    const pe = item.trailingPE;
-    if (typeof pe !== 'number' || pe <= 0) throw new Error('No PE field');
-    const cached = { pe, source: 'Yahoo Finance · QQQ TTM', fetchedAt: Date.now() };
+    const pe = item && item.trailingPE;
+    if (typeof pe !== 'number' || pe <= 0) throw new Error('No PE');
+    const cached = { pe, source: 'Yahoo · QQQ TTM', fetchedAt: Date.now() };
     try { localStorage.setItem(PE_CACHE_KEY, JSON.stringify(cached)); } catch {}
     return cached;
   } catch (e) {
+    log('PE fail:', e.message);
     const raw = localStorage.getItem(PE_CACHE_KEY);
     if (raw) return { ...JSON.parse(raw), source: '离线缓存' };
-    return { pe: null, source: '获取失败 · 可在设置手动输入' };
+    return { pe: null, source: '获取失败 · 设置里手动输入' };
   }
 }
 
@@ -142,11 +183,9 @@ function realizedVol(closes, n = 20) {
 }
 function clamp(x, lo, hi) { return Math.min(hi, Math.max(lo, x)); }
 
-// PE 评分: 当前 PE 越低于历史均值, 分数越高 (越值得加仓)
-// 偏离 -25% 以下 → 100, 偏离 +25% 以上 → 0
 function peScore(currentPE, avgPE) {
   if (!currentPE || !avgPE) return null;
-  const dev = (currentPE - avgPE) / avgPE; // -1 ~ +1
+  const dev = (currentPE - avgPE) / avgPE;
   return clamp(50 - dev * 200, 0, 100);
 }
 function peAdviceText(currentPE, avgPE) {
@@ -160,14 +199,12 @@ function peAdviceText(currentPE, avgPE) {
   return `🔴 PE 显著高估 (+${pct}%) · 建议减仓 / 暂停`;
 }
 
-// ---- 5 因子打分 (0-100，分高 = 适合多投) ----
 function computeFactors(series, peData, avgPE) {
   const closes = series.map(d => d.c);
   const last = closes[closes.length - 1];
   const ma50 = sma(closes, 50);
   const ma200 = sma(closes, 200);
 
-  // 因子 1: 估值 = 50% PE偏离 + 50% 价格 vs MA200
   const dev200 = (ma200 - last) / ma200;
   const f1Tech = clamp(50 + dev200 * 250, 0, 100);
   const f1PE = peScore(peData.pe, avgPE);
@@ -176,21 +213,17 @@ function computeFactors(series, peData, avgPE) {
     ? `PE ${peData.pe.toFixed(1)} vs 均值 ${avgPE.toFixed(1)}（PE 分 ${f1PE.toFixed(0)} · MA200 分 ${f1Tech.toFixed(0)}）`
     : `当前价 ${last.toFixed(0)} vs MA200 ${ma200.toFixed(0)}（偏离 ${(dev200*100).toFixed(2)}%）`;
 
-  // 因子 2: RSI 超卖
   const rsi14 = rsi(closes, 14);
   const f2 = clamp(100 - rsi14, 0, 100);
 
-  // 因子 3: 回撤 (52 周高点)
   const yearSlice = closes.slice(-252);
   const yearHigh = Math.max(...yearSlice);
   const drawdown = (yearHigh - last) / yearHigh;
   const f3 = clamp(drawdown * 250, 0, 100);
 
-  // 因子 4: 波动率 (20日年化)
   const vol = realizedVol(closes, 20);
   const f4 = clamp((vol - 8) / (40 - 8) * 100, 0, 100);
 
-  // 因子 5: 趋势确认 (MA50 vs MA200)
   const trendDev = (ma50 - ma200) / ma200;
   const f5 = clamp(50 + trendDev * 333, 0, 100);
 
@@ -210,25 +243,25 @@ function computeFactors(series, peData, avgPE) {
   };
 }
 
-function scoreToMultiplier(score) {
-  if (score < 20) return 0.5;
-  if (score < 40) return 0.75;
-  if (score < 60) return 1.0;
-  if (score < 80) return 1.5;
+function scoreToMultiplier(s) {
+  if (s < 20) return 0.5;
+  if (s < 40) return 0.75;
+  if (s < 60) return 1.0;
+  if (s < 80) return 1.5;
   return 2.0;
 }
-function scoreToAdvice(score) {
-  if (score < 20) return '🟢 市场偏热 · 建议减仓 / 暂停';
-  if (score < 40) return '🟡 略偏高位 · 适度减少投入';
-  if (score < 60) return '⚪ 中性区间 · 按计划定投';
-  if (score < 80) return '🟠 进入恐慌 · 加大投入';
+function scoreToAdvice(s) {
+  if (s < 20) return '🟢 市场偏热 · 建议减仓 / 暂停';
+  if (s < 40) return '🟡 略偏高位 · 适度减少投入';
+  if (s < 60) return '⚪ 中性区间 · 按计划定投';
+  if (s < 80) return '🟠 进入恐慌 · 加大投入';
   return '🔴 极度低估 · 重仓加码';
 }
-function scoreColor(score) {
-  if (score < 20) return '#ff453a';
-  if (score < 40) return '#ff9f0a';
-  if (score < 60) return '#ffd60a';
-  if (score < 80) return '#9ee04f';
+function scoreColor(s) {
+  if (s < 20) return '#ff453a';
+  if (s < 40) return '#ff9f0a';
+  if (s < 60) return '#ffd60a';
+  if (s < 80) return '#9ee04f';
   return '#30d158';
 }
 
@@ -243,8 +276,6 @@ function renderPE(peData, avgPE) {
   document.getElementById('peCurrent').textContent = peData.pe ? peData.pe.toFixed(2) : '—';
   document.getElementById('peCurrentSrc').textContent = peData.source || '';
   document.getElementById('peAvg').textContent = avgPE.toFixed(1);
-
-  // 把 PE 偏离映射到 0%~100% 滑条 (-50% → 左端低估, +50% → 右端高估)
   let pos = 50;
   if (peData.pe && avgPE) {
     const dev = (peData.pe - avgPE) / avgPE * 100;
@@ -254,10 +285,9 @@ function renderPE(peData, avgPE) {
   document.getElementById('peAdvice').textContent = peAdviceText(peData.pe, avgPE);
 }
 
-function render(data, stale = false) {
+function render(data, meta) {
   const { last, prev, composite, factors } = data;
   lastFactors = data;
-
   document.getElementById('price').textContent = last.toFixed(2);
   const diff = last - prev;
   const diffPct = (diff / prev) * 100;
@@ -265,15 +295,15 @@ function render(data, stale = false) {
   ch.textContent = `${diff >= 0 ? '+' : ''}${diff.toFixed(2)} (${diff >= 0 ? '+' : ''}${diffPct.toFixed(2)}%)`;
   ch.className = 'change ' + (diff >= 0 ? 'up' : 'down');
 
-  document.getElementById('updated').textContent =
-    (stale ? '⚠ 离线缓存 · ' : '') + '更新于 ' + new Date().toLocaleString('zh-CN', { hour12: false });
+  const stamp = new Date().toLocaleString('zh-CN', { hour12: false });
+  const tag = meta.stale ? '⚠ 离线缓存 · ' : `[${meta.source}] `;
+  document.getElementById('updated').textContent = tag + '更新于 ' + stamp;
 
   const arcLen = 251;
   document.getElementById('gaugeArc').setAttribute('stroke-dasharray', `${(composite / 100) * arcLen} ${arcLen}`);
   const scoreEl = document.getElementById('scoreNum');
   scoreEl.textContent = composite.toFixed(0);
   scoreEl.style.color = scoreColor(composite);
-
   document.getElementById('advice').textContent = scoreToAdvice(composite);
 
   const mult = scoreToMultiplier(composite);
@@ -297,28 +327,41 @@ function render(data, stale = false) {
     `;
     wrap.appendChild(div);
   }
+  hideError();
 }
 
 function showError(msg) {
-  let banner = document.querySelector('.error');
+  let banner = document.getElementById('errorBanner');
   if (!banner) {
     banner = document.createElement('div');
+    banner.id = 'errorBanner';
     banner.className = 'error';
-    document.querySelector('.app').insertBefore(banner, document.querySelector('.hero').nextSibling);
+    const app = document.querySelector('.app');
+    app.insertBefore(banner, app.firstChild);
   }
   banner.textContent = msg;
 }
+function hideError() {
+  const b = document.getElementById('errorBanner');
+  if (b) b.remove();
+}
+
+function setLoading(on) {
+  document.getElementById('updated').textContent = on ? '加载中…' : document.getElementById('updated').textContent;
+}
 
 async function refresh() {
+  setLoading(true);
   try {
     const [chartRes, peRes] = await Promise.all([fetchChart(), fetchPE()]);
     lastPE = peRes;
     const avgPE = parseFloat(settings.avgPE) || 24;
     renderPE(peRes, avgPE);
     const data = computeFactors(chartRes.series, peRes, avgPE);
-    render(data, !!chartRes.stale);
+    render(data, { stale: !!chartRes.stale, source: chartRes.source || '?' });
   } catch (e) {
-    showError('数据获取失败: ' + (e.message || e));
+    showError('行情获取失败: ' + (e.message || e) + ' — 可能浏览器拦截了第三方请求，下拉刷新重试，或在设置手动输入 PE。');
+    document.getElementById('updated').textContent = '获取失败 · 点 ↻ 重试';
   }
 }
 
@@ -338,13 +381,13 @@ function bindSettings() {
     if (!isNaN(v) && v > 0) {
       settings.baseAmount = v;
       saveSettings();
-      if (lastFactors) render(lastFactors);
+      if (lastFactors) render(lastFactors, { source: 'cache' });
     }
   });
   curSel.addEventListener('change', () => {
     settings.currency = curSel.value;
     saveSettings();
-    if (lastFactors) render(lastFactors);
+    if (lastFactors) render(lastFactors, { source: 'cache' });
   });
   manualPEInput.addEventListener('change', () => {
     settings.manualPE = manualPEInput.value;
